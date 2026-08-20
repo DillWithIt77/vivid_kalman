@@ -85,55 +85,6 @@ class VCNN_ROM(nn.Module):
         return self.fc(x)  # (B, q)
 
 
-# def train_vcnn(model, train_loader, val_loader=None, n_epochs=50, lr=1e-3,
-#                 device="cpu"):
-#     """
-#     Standard supervised training loop: MSE(model(Y_tilde), X).
-#     train_loader/val_loader should yield (Y_tilde, target) batches, each
-#     (B, 1, N, N) for VCNN or (B, 1, N, N)/(B, q) for VCNN_ROM.
-#     """
-#     model.to(device)
-#     opt = torch.optim.Adam(model.parameters(), lr=lr)
-#     loss_fn = nn.MSELoss()
-
-#     history = {"train_loss": [], "val_loss": []}
-#     for epoch in range(n_epochs):
-#         model.train()
-#         running = 0.0
-#         n = 0
-#         for Yt, target in train_loader:
-#             Yt, target = Yt.to(device), target.to(device)
-#             opt.zero_grad()
-#             pred = model(Yt)
-#             loss = loss_fn(pred, target)
-#             loss.backward()
-#             opt.step()
-#             running += loss.item() * Yt.shape[0]
-#             n += Yt.shape[0]
-#         train_loss = running / n
-#         history["train_loss"].append(train_loss)
-
-#         val_loss = None
-#         if val_loader is not None:
-#             model.eval()
-#             running, n = 0.0, 0
-#             with torch.no_grad():
-#                 for Yt, target in val_loader:
-#                     Yt, target = Yt.to(device), target.to(device)
-#                     pred = model(Yt)
-#                     loss = loss_fn(pred, target)
-#                     running += loss.item() * Yt.shape[0]
-#                     n += Yt.shape[0]
-#             val_loss = running / n
-#             history["val_loss"].append(val_loss)
-
-#         msg = f"epoch {epoch+1}/{n_epochs}  train_loss={train_loss:.6g}"
-#         if val_loss is not None:
-#             msg += f"  val_loss={val_loss:.6g}"
-#         print(msg)
-
-#     return history
-
 def train_vcnn(model, train_loader, val_loader=None, n_epochs=50, lr=1e-3,
                device="cpu", save_path=None):
     """
@@ -193,7 +144,23 @@ def train_vcnn(model, train_loader, val_loader=None, n_epochs=50, lr=1e-3,
     return history
 
 
-def estimate_P(model, val_loader, device="cpu"):
+def gaspari_cohn(rho):
+    """Gaspari-Cohn localization function, Eq. 20. rho = r / L (>=0)."""
+    rho = np.asarray(rho, dtype=float)
+    G = np.zeros_like(rho)
+
+    m1 = rho < 1
+    r = rho[m1]
+    G[m1] = 1 - (5/3)*r**2 + (5/8)*r**3 + (1/2)*r**4 - (1/4)*r**5
+
+    m2 = (rho >= 1) & (rho < 2)
+    r = rho[m2]
+    G[m2] = (4 - 5*r + (5/3)*r**2 + (5/8)*r**3 - (1/2)*r**4
+             + (1/12)*r**5 - (2/3)/r)
+
+    return G  # rho >= 2 stays 0
+
+def inv_op_residuals(model, val_loader, device="cpu"):
     """
     Eq. 19: empirically estimate P_t (error covariance of the learned
     inverse operator) on an independent validation set, as the sample
@@ -213,3 +180,46 @@ def estimate_P(model, val_loader, device="cpu"):
     import numpy as np
     residuals = np.concatenate(residuals, axis=0)  # (n_val, 1, N, N)
     return residuals
+
+
+def estimate_P(residuals, L):
+    """
+    Empirically estimates P_t from validation residuals (Eq. 19) 
+    and applies Gaspari-Cohn localization (Eq. 20-21).
+
+    Parameters
+    ----------
+    residuals : (n_val, N, N) array of spatial residuals (target - pred)
+    L         : float, Gaspari-Cohn correlation scale length
+
+    Returns
+    -------
+    P_t : (N*N, N*N) localized empirical error covariance matrix
+    """
+    n_val, N, _ = residuals.shape
+    n_pixels = N * N
+    
+    # 1. Flatten the spatial dimensions to 1D vectors per sample
+    res_flat = residuals.reshape(n_val, n_pixels)
+    
+    # 2. Compute the raw sample covariance matrix P_t (Eq. 19)
+    # rowvar=False treats columns as variables (grid pixels) and rows as samples
+    P_t = np.cov(res_flat, rowvar=False)
+    
+    # 3. Create 2D grid coordinates for every flattened index
+    ii, jj = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
+    coords = np.stack([ii.ravel(), jj.ravel()], axis=-1)  # Shape: (N*N, 2)
+    
+    # 4. Compute pairwise Euclidean distances d(a, b) between all pixels
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    distances = np.linalg.norm(diff, axis=-1)
+    
+    # 5. Calculate normalized distance rho = r / L and evaluate Gaspari-Cohn (Eq. 20)
+    rho = distances / L
+    G = gaspari_cohn(rho)  # Requires the Gaspari-Cohn function definition
+    
+    # 6. Element-wise localization of the covariance matrix (Eq. 21)
+    P_t_localized = P_t * G
+    
+    return P_t_localized
+

@@ -1,5 +1,5 @@
 """
-run_pipeline_example.py
+exp_pipeline.py
 
 End-to-end example wiring the pipeline together on data exported by
 matlab/export_snapshots.m. Includes caching checks to skip completed steps 
@@ -21,18 +21,26 @@ from vivid_da import da_3dvar, da_vivid, r_rmse, ssim
 rng = np.random.default_rng(0)
 
 # ==========================================
+# DEVICE SETUP
+# ==========================================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+if device == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# ==========================================
 # GLOBAL CONTROL FLAG
 # ==========================================
-FORCE_RERUN = False  # Set to True to override caches and run everything fresh
+FORCE_RERUN = True  # Set to True to override caches and run everything fresh
 
 # Setup directories
 script_dir = Path(__file__).resolve().parent
-base_dir = script_dir.parent
-cache_dir = base_dir / "cache_outputs"
+base_dir = script_dir.parent  # still used below to locate the sibling matlab/ folder
+cache_dir = script_dir / "cache_outputs"
 cache_dir.mkdir(exist_ok=True)
-output_dir = base_dir / "plot_outputs"
+output_dir = script_dir / "plot_outputs"
 output_dir.mkdir(exist_ok=True)
-model_output_dir = base_dir / "model_outputs"
+model_output_dir = script_dir / "model_outputs"
 model_output_dir.mkdir(exist_ok=True)
 
 # ---- 1. Load data (with caching) ------------------------------------------
@@ -47,7 +55,7 @@ if processed_data_path.exists() and not FORCE_RERUN:
     print(f"Loaded from cache: {len(X_train)} training snapshots, {len(X_test)} test snapshots.")
 else:
     print('Loading data from MATLAB manifests...')
-    target_dtsave = 0.001  
+    target_dtsave = 0.01  
 
     manifest_path = base_dir / "matlab" / "data" / "vivid_ensemble_manifest.mat"
     if not manifest_path.exists():
@@ -113,11 +121,13 @@ val_loader = DataLoader(TensorDataset(Y_train[:n_val], Xt_train[:n_val]), batch_
 
 # ---- 3. Train VCNN (with weight caching & validation tracking) -------------
 model = VCNN(channels=48, n_layers=6)
+model.to(device)
 best_model_path = model_output_dir / "best_vcnn_model.pth"
 
 if best_model_path.exists() and not FORCE_RERUN:
     print(f'Pre-trained VCNN weights found. Loading from {best_model_path}...')
-    model.load_state_dict(torch.load(best_model_path, map_location="cpu"))
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.to(device)
     model.eval()
 else:
     print('No pre-trained model found (or FORCE_RERUN is True). Training VCNN...')
@@ -127,10 +137,11 @@ else:
         val_loader=val_loader, 
         n_epochs=20, 
         lr=1e-3, 
-        device="cpu", 
+        device=device, 
         save_path=best_model_path
     )
-    model.load_state_dict(torch.load(best_model_path, map_location="cpu"))
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.to(device)
     model.eval()
     print(f'Training complete. Best model loaded and ready from {best_model_path}')
 
@@ -149,8 +160,8 @@ for idx in check_idx:
     Y_tilde, coords, y = build_tessellated_observation(
         x_true_train, n_grid=N_GRID, r_s=3, obs_noise_std=OBS_NOISE_STD, rng=rng)
     with torch.no_grad():
-        Yt_in = torch.tensor(Y_tilde[None, None], dtype=torch.float32)
-        x_v_train = model(Yt_in).numpy()[0, 0].astype(np.float64)
+        Yt_in = torch.tensor(Y_tilde[None, None], dtype=torch.float32, device=device)
+        x_v_train = model(Yt_in).cpu().numpy()[0, 0].astype(np.float64)
     rrmse_v_train.append(calc_rrmse(x_v_train, x_true_train))
 
 rrmse_v_train = np.array(rrmse_v_train)
@@ -158,12 +169,16 @@ print(f"In-distribution (train-run) raw VCNN R-RMSE: "
       f"mean={rrmse_v_train.mean():.4f}  std={rrmse_v_train.std():.4f}")
 
 # ---- 4. Estimate P_t from residuals on the validation split (Eq. 19) -----
-USE_LOCALIZATION = True
-residuals = estimate_P(model, val_loader)  
-P_std = residuals.std()
-P_cov = StationaryCovariance(N, L=5, kernel=matern32, gaspari_cohn_localize=USE_LOCALIZATION)
+# Define your correlation scale length (as specified in your paper/settings)
+L = 5.0  
+residuals_raw = inv_op_residuals(model, val_loader, device=device)  # shape: (n_val, 1, N, N)
+# Squeeze out the singleton channel dimension to get (n_val, N, N)
+residuals = residuals_raw.squeeze(axis=1)
+# Compute the fully empirical, Gaspari-Cohn localized P_t matrix (Eq. 19-21)
+P_t_localized = estimate_P(residuals, L=L)
 
 # ---- 5. Run DA comparison on the held-out test run (with caching per snapshot) ----
+USE_LOCALIZATION = False
 print('Run DA comparison and saving spatial data...')
 s_b = 0.02         
 r_obs_std = 0.0    
@@ -176,7 +191,7 @@ print(f"Running DA comparison on {n_snapshots} test snapshots "
 results = {"DA": [], "VIVID": []}
 
 for i, x_true in enumerate(X_test[:n_snapshots]):
-    snapshot_file = output_dir / f"test_snapshot_{i}.npz"
+    snapshot_file = output_dir / f"experiment_snapshot_{i}.npz"
 
     if snapshot_file.exists() and not FORCE_RERUN:
         snap_data = np.load(snapshot_file, allow_pickle=True)
@@ -187,7 +202,7 @@ for i, x_true in enumerate(X_test[:n_snapshots]):
         results["VIVID"].append(r_rmse(x_a_vivid, x_true))
         print(f"snapshot {i}: Loaded from cache (DA R-RMSE={results['DA'][-1]:.3f}, VIVID R-RMSE={results['VIVID'][-1]:.3f})")
     else:
-        x_b, B_cov = make_background(x_true, s_b=s_b, L=5, rng=rng, localize=USE_LOCALIZATION)
+        x_b, B_cov = make_background(x_true, s_b=s_b, L=L, rng=rng, localize=USE_LOCALIZATION)
 
         Y_tilde, coords, y_obs = build_tessellated_observation(
             x_true, n_grid=N_GRID, r_s=3, obs_noise_std=r_obs_std, rng=rng)
@@ -199,10 +214,10 @@ for i, x_true in enumerate(X_test[:n_snapshots]):
 
         # Run VIVID
         with torch.no_grad():
-            Yt_in = torch.tensor(Y_tilde[None, None], dtype=torch.float32)
-            x_v = model(Yt_in).numpy()[0, 0].astype(np.float64)
+            Yt_in = torch.tensor(Y_tilde[None, None], dtype=torch.float32, device=device)
+            x_v = model(Yt_in).cpu().numpy()[0, 0].astype(np.float64)
         x_a_vivid, n_iter_vivid, j_hist_vivid = da_vivid(x_b, x_v, y_obs, coords_t,
-                                                         B_cov, P_cov,
+                                                         B_cov, P_t_localized,
                                                          r_obs_std=max(r_obs_std, 1e-3))
 
         results["DA"].append(r_rmse(x_a_da, x_true))

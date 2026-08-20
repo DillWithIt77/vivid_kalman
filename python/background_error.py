@@ -65,14 +65,17 @@ class StationaryCovariance:
         self.N = N
         self.L = L
 
+        ###computes the distance r from paper (see Eq. 20)
         ii, jj = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
         # periodic (wrap-around) distance from (0,0)
         di = np.minimum(ii, N - ii)
         dj = np.minimum(jj, N - jj)
         r = np.sqrt(di**2 + dj**2)
 
+        ###builds a baseline kernal parametered by L (forces smoothness, so not computing raw covariance matrix entries)
         kernel_grid = kernel(r, L)
         if gaspari_cohn_localize:
+            ###tapers using the Gaspari-Cohn function
             kernel_grid = kernel_grid * gaspari_cohn(r / L)
 
         # power spectrum = FFT of the (real, symmetric) correlation kernel;
