@@ -6,19 +6,19 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 script_dir = Path(__file__).resolve().parent
-output_dir = script_dir.parent / "plot_outputs"
+output_dir = script_dir / "plot_outputs"
 
-# Auto-detect every test_snapshot_*.npz present, instead of a hardcoded list.
+# Auto-detect every experiment_snapshot_*.npz present, instead of a hardcoded list.
 # This stays in sync automatically as you change N_TEST_SNAPSHOTS in
 # run_pipeline_example.py.
 snapshot_files = sorted(
-    output_dir.glob("test_snapshot_*.npz"),
+    output_dir.glob("experiment_snapshot_*.npz"),
     key=lambda p: int(p.stem.split("_")[-1]),
 )
 
 if not snapshot_files:
     raise FileNotFoundError(
-        f"No test_snapshot_*.npz files found in {output_dir}. Run your pipeline first!"
+        f"No experiment_snapshot_*.npz files found in {output_dir}. Run your pipeline first!"
     )
 
 print(f"Found {len(snapshot_files)} snapshot file(s) in {output_dir}")
