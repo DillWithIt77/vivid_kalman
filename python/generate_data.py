@@ -8,7 +8,7 @@ from pathlib import Path
 FORCE_RERUN = False  # Set to True to override checks and rerun all MATLAB steps
 
 print("Starting MATLAB engine...")
-eng = matlab.engine.start_matlab('-nodisplay -nosplash -nojvm')
+eng = matlab.engine.start_matlab('-nodisplay -nosplash')
 
 root_dir = os.path.abspath(os.path.join(os.getcwd(), ".."))
 matlab_code = os.path.join(root_dir, "matlab")
@@ -17,7 +17,7 @@ eng.cd(matlab_code)
 data_dir = Path(matlab_code) / "data"
 manifest_path = data_dir / "vivid_ensemble_manifest.mat"
 
-dtsave = 0.001
+dtsave = 0.01
 
 # ----------------------------------------------------
 # 1. Check & Run generate_ensemble.m
@@ -26,12 +26,12 @@ if manifest_path.exists() and not FORCE_RERUN:
     print(f"Ensemble manifest found at {manifest_path}. Skipping generate_ensemble.m...")
 else:
     print("Running generate_ensemble.m...")
-    # Uncomment when ready to execute:
-    # eng.generate_ensemble(nargout=0)
+    eng.generate_ensemble(dtsave, nargout=0)
 
 # ----------------------------------------------------
 # 2. Check & Run run_diagnostics.m
 # ----------------------------------------------------
+FORCE_RERUN = True
 # We check if the manifest exists first so we can look inside it, 
 # or check if every run folder already contains its 'diagnostics_plot.png'
 diagnostics_needed = True
@@ -60,6 +60,7 @@ if diagnostics_needed or FORCE_RERUN:
 # ----------------------------------------------------
 # 3. Check & Run export_snapshots.m
 # ----------------------------------------------------
+# FORCE_RERUN = True
 snapshots_needed = True
 if manifest_path.exists() and not FORCE_RERUN:
     import scipy.io as sio
