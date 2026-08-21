@@ -10,7 +10,7 @@ Both take a single-channel (N, N) tessellated observation as input.
 Since our QG domain is square and Nx=Ny=Mx=My, no cropping/resizing
 layer is needed (paper's optional Cropping2D is for non-square cases).
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path

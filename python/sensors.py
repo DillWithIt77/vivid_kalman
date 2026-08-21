@@ -119,29 +119,99 @@ def build_tessellated_observation(X, n_grid, r_s=3, obs_noise_std=0.0, nonlinear
     return Y_tilde, coords, y
 
 
-def nonlinear_observation_field(X, beta_field=None):
+import torch
+
+# Cache of precomputed kernel FFTs, keyed by (N, radius, dtype, device).
+# The kernel doesn't depend on the field X, only on the grid size and
+# radius, so redoing its FFT on every call (e.g. every L-BFGS iteration
+# inside vivid_da.py's DA loop) would be wasted work.
+_KERNEL_FFT_CACHE = {}
+
+
+def _circular_disk_kernel(N, radius, device=None, dtype=torch.float64):
     """
-    Optional: paper's Eq. 42-44 nonlinear local weighted-sum-of-squares
-    observation field. Not used by default (we observe the state
-    directly, as noted above), but provided for parity with the paper.
-    rho1 = disk radius 3, rho2 = disk radius 1.5 (in pixels).
+    (N, N) real kernel, 1 inside `radius` of index (0,0) using PERIODIC
+    (torus) distance, 0 outside. Centering the disk at index 0 (rather
+    than the middle of the array) is what makes the FFT convolution
+    below a true circular convolution: torch.fft.fft2 / ifft2 are
+    inherently periodic, so as long as the kernel encodes wraparound
+    distance, so does the convolution result -- correctly matching a
+    doubly-periodic QG domain, unlike scipy's fftconvolve (zero-padded,
+    i.e. implicitly non-periodic boundaries).
     """
-    from scipy.ndimage import uniform_filter
+    idx = torch.arange(N, device=device, dtype=dtype)
+    d = torch.minimum(idx, N - idx)  # periodic distance to 0, per axis
+    dy, dx = torch.meshgrid(d, d, indexing="ij")
+    dist = torch.sqrt(dy**2 + dx**2)
+    return (dist <= radius).to(dtype)
+
+
+def _get_kernel_fft(N, radius, device, dtype):
+    key = (N, radius, dtype, device)
+    if key not in _KERNEL_FFT_CACHE:
+        kernel = _circular_disk_kernel(N, radius, device=device, dtype=dtype)
+        _KERNEL_FFT_CACHE[key] = torch.fft.fft2(kernel)
+    return _KERNEL_FFT_CACHE[key]
+
+
+def _circular_local_sum(field, kernel_fft):
+    """
+    Periodic 2D convolution of `field` (real torch tensor, may require
+    grad) with a precomputed kernel FFT, via the convolution theorem.
+    Differentiable w.r.t. `field` -- kernel_fft is treated as constant.
+    """
+    field_fft = torch.fft.fft2(field.to(kernel_fft.real.dtype))
+    return torch.fft.ifft2(field_fft * kernel_fft).real
+
+
+def nonlinear_observation_field_torch(X, beta_field=None, r1=3, r2=1.5):
+    """
+    Paper's Eq. 42-44 nonlinear local weighted-sum-of-squares observation
+    field, adapted to be (a) doubly PERIODIC, matching the QG domain
+    (the paper's own shallow-water setup was non-periodic, so this is a
+    deliberate change, not a literal reproduction), and (b) torch-based
+    and autograd-differentiable, so it can be used both for offline data
+    generation (via the numpy wrapper below) AND directly inside
+    vivid_da.py's DA objective (gradients need to flow through it there).
+
+    X : (N, N) torch tensor, real, may require_grad
+    beta_field : (N, N) torch tensor or None. None -> ones, matching the
+        official reference implementation (voronoi_preprocessing.py),
+        which hardcodes a constant `+= 1` for the inner neighborhood --
+        NOT a spatially-varying field, despite the paper's beta_{ix,jx}
+        notation suggesting otherwise (see chat discussion / repo).
+    r1, r2 : outer / inner neighborhood radii. Defaults match the
+        reference code's actual values (2.9, 1.5), not the paper's
+        rounded r<=3 in Eq. 43.
+    """
     N = X.shape[0]
+    dtype = X.dtype if X.dtype in (torch.float32, torch.float64) else torch.float64
+    device = X.device
+
     if beta_field is None:
-        beta_field = np.ones((N, N))
+        beta_field = torch.ones((N, N), dtype=dtype, device=device)
 
-    def disk_mask(radius):
-        r = int(np.ceil(radius))
-        yy, xx = np.meshgrid(np.arange(-r, r + 1), np.arange(-r, r + 1), indexing="ij")
-        return (np.sqrt(xx**2 + yy**2) <= radius).astype(float)
+    k1_fft = _get_kernel_fft(N, r1, device, dtype)
+    k2_fft = _get_kernel_fft(N, r2, device, dtype)
 
-    def local_sum(field, radius):
-        mask = disk_mask(radius)
-        from scipy.signal import fftconvolve
-        return fftconvolve(field, mask, mode="same")
-
-    X2 = X**2
-    term1 = 0.5 * local_sum(X2, 3.0)
-    term2 = local_sum(beta_field * X2, 1.5)
+    X2 = X ** 2
+    term1 = 0.5 * _circular_local_sum(X2, k1_fft)
+    term2 = _circular_local_sum(beta_field * X2, k2_fft)
     return term1 + term2
+
+
+def nonlinear_observation_field(X, beta_field=None, r1=3, r2=1.5):
+    """
+    Numpy-facing convenience wrapper around
+    `nonlinear_observation_field_torch`, for callers (e.g.
+    build_tessellated_observation below) that work with plain numpy
+    arrays during offline data generation and don't need gradients.
+    For the DA loop (vivid_da.py), call the torch version directly on
+    the live tensor instead of round-tripping through numpy here, so
+    the autograd graph stays intact.
+    """
+    X_t = torch.from_numpy(np.asarray(X, dtype=np.float64))
+    beta_t = None if beta_field is None else torch.from_numpy(np.asarray(beta_field, dtype=np.float64))
+    with torch.no_grad():
+        out = nonlinear_observation_field_torch(X_t, beta_field=beta_t, r1=r1, r2=r2)
+    return out.numpy()

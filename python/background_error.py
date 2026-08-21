@@ -114,7 +114,7 @@ class StationaryCovariance:
         return np.real(np.fft.ifft2(np.fft.fft2(x) / denom))
 
 
-def make_background(X_true, s_b, L, rng=None):
+def make_background(X_true, s_b, L, rng=None, localize = False):
     """
     Eq. 41: x_b,t = x_t + s_b * eps_b,t,  eps_b,t ~ N(0, B(phi(L,r))).
 
@@ -130,7 +130,7 @@ def make_background(X_true, s_b, L, rng=None):
     cov : StationaryCovariance  (reuse this as B_t in the DA objective)
     """
     N = X_true.shape[0]
-    cov = StationaryCovariance(N, L, kernel=matern32)
+    cov = StationaryCovariance(N, L, kernel=matern32, gaspari_cohn_localize = localize)
     noise = cov.sample(std=1.0, rng=rng)
     X_b = X_true + s_b * noise
     return X_b, cov

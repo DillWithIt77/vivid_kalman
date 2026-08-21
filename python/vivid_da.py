@@ -37,7 +37,7 @@ def ssim(x_est, x_true, data_range=None):
     try:
         from skimage.metrics import structural_similarity as sk_ssim
     except ImportError as e:
-        raise ImportError("pip install scikit-image for SSIM") from e
+        raise ImportError("pip install scikit-image for SSIM") from 
     if data_range is None:
         data_range = x_true.max() - x_true.min()
     return sk_ssim(x_est, x_true, data_range=data_range)
@@ -74,8 +74,22 @@ def obs_term(x, y_obs, sensor_coords, r_obs_std):
 
 
 def inv_op_term(x, x_v, Sk_tensor_P):
-    """0.5 * ||x - x_v||^2_{P^-1}, same Fourier-diagonal trick as B."""
+    """0.5 * ||x - x_v||^2_{P^-1}, same Fourier-diagonal trick as B.
+    Only valid when P_t is modeled as stationary (has a .Sk spectrum)."""
     return bg_term_autograd(x, x_v, Sk_tensor_P)
+
+
+def inv_op_term_dense(x, x_v, P_inv_tensor):
+    """
+    0.5 * ||x - x_v||^2_{P^-1} using a dense, precomputed P^-1 -- for when
+    P_t is the true empirical (Gaspari-Cohn localized) covariance from
+    `vcnn.estimate_P` (Eq. 19-21), rather than a stationary approximation.
+    P_inv_tensor: (N*N, N*N) torch tensor, the regularized pseudo-inverse
+    of P_t_localized, precomputed once outside the optimization loop.
+    """
+    N = x.shape[0]
+    diff = (x - x_v).reshape(-1)
+    return 0.5 * diff @ (P_inv_tensor @ diff)
 
 
 # --------------------------------------------------------------- solvers --
@@ -116,23 +130,57 @@ def da_3dvar(x_b, y_obs, sensor_coords, B_cov, r_obs_std, maxiter=200):
     return _run_lbfgs(objective, x_b.copy(), N, maxiter=maxiter)
 
 
+def _dense_P_inv(P_t_localized, rcond=1e-6):
+    """
+    Build the regularized inverse of a dense empirical covariance matrix
+    (from vcnn.estimate_P) once, for reuse across all DA solves in a run.
+
+    Uses a pseudo-inverse rather than a plain inverse: with n_val
+    validation samples over N*N pixels, P_t_localized is rank-deficient
+    (rank <= n_val - 1) whenever n_val < N*N, which is the common case --
+    a plain np.linalg.inv would fail or blow up numerically. `rcond`
+    controls how aggressively small/noisy singular values are treated as
+    zero (standard Tikhonov-style regularization for this situation).
+
+    Returns a (N*N, N*N) numpy array; convert to a torch tensor once
+    (dtype float64) before passing into da_vivid repeatedly, to avoid
+    rebuilding it per snapshot.
+    """
+    P_inv = np.linalg.pinv(P_t_localized, rcond=rcond)
+    return P_inv
+
+
 def da_vivid(x_b, x_v, y_obs, sensor_coords, B_cov, P_cov, r_obs_std, maxiter=200):
     """
     VIVID, Eq. 18: background + inverse-operator + observation terms.
     x_v: VCNN(Y_tilde) prediction, same shape as x_b (Section 3.2).
-    P_cov: StationaryCovariance modeling P_t (or build one from the
-           empirical residuals via estimate_P + fit a Matern length).
+
+    P_cov may be either:
+      - a StationaryCovariance (or duck-type exposing `.Sk`) -- uses the
+        cheap Fourier-diagonal path, or
+      - a torch.Tensor of shape (N*N, N*N) -- treated as an already
+        regularized dense P^-1 (see `_dense_P_inv`), and the true
+        empirical covariance from `vcnn.estimate_P` (Eq. 19-21) is used
+        directly via a dense quadratic form.
     """
     N = x_b.shape[0]
     Sk_B = torch.tensor(B_cov.Sk, dtype=torch.float64)
-    Sk_P = torch.tensor(P_cov.Sk, dtype=torch.float64)
     x_b_t = torch.tensor(x_b, dtype=torch.float64)
     x_v_t = torch.tensor(x_v, dtype=torch.float64)
     y_t = torch.tensor(y_obs, dtype=torch.float64)
 
+    use_dense_P = isinstance(P_cov, torch.Tensor)
+    if use_dense_P:
+        P_inv_t = P_cov  # already a (N*N, N*N) regularized inverse, precomputed once
+    else:
+        Sk_P = torch.tensor(P_cov.Sk, dtype=torch.float64)
+
     def objective(x_t):
         J_b = bg_term_autograd(x_t, x_b_t, Sk_B)
-        J_p = inv_op_term(x_t, x_v_t, Sk_P)
+        if use_dense_P:
+            J_p = inv_op_term_dense(x_t, x_v_t, P_inv_t)
+        else:
+            J_p = inv_op_term(x_t, x_v_t, Sk_P)
         J_o = obs_term(x_t, y_t, sensor_coords, r_obs_std)
         return J_b + J_p + J_o
 
