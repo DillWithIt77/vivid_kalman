@@ -1,39 +1,65 @@
-function datafolder = Driver_Spectral_ARK4_w_unif(N,beta,kf,epsf,sigf,alpf, dd,tau0,tdel,Nt,forcingtype, dtsave, spinup_frac)
+function datafolder = Driver_Spectral_ARK4_w_unif(N,beta,kf,epsf,sigf,alpf, ...
+    dd,tau0,tdel,t_spinup,n_save,forcingtype, dtsave, Nt_max, n_diag)
 % This script solves barotropic QG flow in a doubly-periodic domain.
-% adaptive RK4 integrator with on-the-fly uniform temporal sampling.
+% Adaptive RK4 integrator with on-the-fly uniform temporal sampling.
+%
+% Stopping is now driven by SIMULATED TIME / SNAPSHOT COUNT rather than
+% iteration count, so every run in an ensemble (regardless of tau0, which
+% changes how the adaptive dt behaves) gets:
+%   - the same physical spin-up window discarded (t_spinup)
+%   - the same fixed number of uniform-dt snapshots recorded (n_save)
+%
+% Nt_max is only a safety cap on adaptive iterations (e.g. in case dt
+% collapses or the run stalls before reaching n_save) -- it is NOT the
+% intended stopping condition.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+N = double(N);
 
-if nargin < 12 || isempty(dtsave)
+if nargin < 13 || isempty(dtsave)
     dtsave = 0.05; % Default uniform save interval if not specified
 end
-if nargin < 13 || isempty(spinup_frac)
-    spinup_frac = 0.1; % Default: treat first 10% of Nt iterations as spin-up (not recorded)
+if nargin < 14 || isempty(Nt_max)
+    Nt_max = 2e6; % Default safety cap on adaptive iterations
 end
+if nargin < 15 || isempty(n_diag)
+    n_diag = 100; % target number of diagnostic points recorded post-spinup
+end
+diag_dt = max(n_save*dtsave/n_diag, 1e-8); % simulated-time spacing between diagnostic recordings
 
 % Set simulation parameters
 qlim = 1.5E5; % if any q > qlim, simulation stops
 
 % Set physical parameters
 sh = 8; % hyperdiffusion exponent (needs to be even)
-if N == 128
+if N == 64 %not 100% sure on this, so should run some tests to make sure it is behaving as expected
+    nu = 1.64e-23 *(kf/50)^(-2*sh+2/3);
+elseif N == 128
     if epsf == 0
-        nu = 2.5e-28 *(50/50)^(-2*sh+2/3); 
+        nu = 2.5e-28 *(50/50)^(-2*sh+2/3);
     else
-        nu = 2.5e-28 *(kf/50)^(-2*sh+2/3); 
+        nu = 2.5e-28 *(kf/50)^(-2*sh+2/3);
     end
 elseif N == 256
-    nu = 5E-33 *(kf/50)^(-2*sh+2/3); 
+    nu = 5E-33 *(kf/50)^(-2*sh+2/3);
     if tau0 == 0
         nu = nu*100;
     end
 elseif N == 512
     nu = 1E-34 *(kf/50)^(-2*sh+2/3);
+else
+    error('Driver_Spectral_ARK4_w_unif:unsupportedN', ...
+        ['No hyperviscosity coefficient nu is calibrated for N=%d. ' ...
+         'Supported values are 64, 128, 256, 512. Add a case for this N ' ...
+         '(see chat history for how the N=64 coefficient was extrapolated).'], N);
 end
 
-% Put useful stuff into a struct
+% Put useful stuff into a struct (dd still lives here since RHS_Spectral /
+% QG_Diagnostics need it -- it just isn't tracked in the ensemble manifest
+% or printed anywhere anymore, since it isn't being swept in this study)
 params = struct('beta',beta, 'sh',sh, 'dd',dd, 'nu',nu, 'N',N,...
     'kf',kf, 'epsf',epsf, 'sigf',sigf, 'alpf',alpf,...
-    'tau0',tau0, 'tdel',tdel,'forcingtype',forcingtype, 'spinup_frac',spinup_frac);
+    'tau0',tau0, 'tdel',tdel,'forcingtype',forcingtype, ...
+    't_spinup',t_spinup, 'n_save',n_save);
 
 % Set up hyperviscous PV dissipation and linear damping
 k = [0:N/2 -N/2+1:-1]'; % wavenumbers
@@ -83,9 +109,11 @@ qp(:,:) = qp(:,:) - mean(mean(qp(:,:)));
 q = fft2(qp);
 
 % Diagnostics
-countDiag = 100; % Compute diagnostics every countDiag steps
-spinup_iters = round(spinup_frac*Nt); % iterations to skip as spin-up (not recorded)
-nDiagMax = floor((Nt - spinup_iters)/countDiag) + 1; % upper bound on # of diagnostic records post spin-up
+% Diagnostics are now recorded on a simulated-TIME grid (spacing diag_dt),
+% not an iteration-count grid, so every run gets ~n_diag diagnostic points
+% post-spinup regardless of how tau0 affects the adaptive step size.
+nDiagMax = ceil(n_save*dtsave/diag_dt) + 10; % small safety buffer
+next_diag_t = 0; % next simulated time at which to record diagnostics
 T = zeros(1, nDiagMax);
 vb = zeros(1, nDiagMax);
 utz = zeros(N, nDiagMax);
@@ -110,11 +138,15 @@ if epsf ~= 0
     else
         fstr = sprintf('%s_kf%i_epsf%0.2g_sigf%0.1g_alpha%0.0g', fstr, kf, epsf, sigf, alpf);
     end
-end  
-casestr = sprintf('baroARK4_N%i_beta%0.2g_d%.2g_nu%.2g_%s_Nt%i', N, beta, dd, nu, fstr, Nt);
+end
+% dd is kept in the folder name purely so runs remain uniquely/traceably
+% identified on disk -- it's not printed or tracked anywhere else since
+% it's a fixed value in this study, not swept.
+casestr = sprintf('baroARK4_N%i_beta%0.2g_d%.2g_nu%.2g_%s_tsp%.3g_nsave%i', ...
+    N, beta, dd, nu, fstr, t_spinup, n_save);
 casestr = strcat(casestr, strcat('_set-', datestr(datetime('now'),'mm-dd-yy-hhMMss')));
 
-datafolder = fullfile('data', casestr);
+datafolder = fullfile('data', sprintf('N%d', N), casestr);
 if ~isfolder(datafolder); mkdir(datafolder); end
 
 % Setup on-the-fly uniform cache file using matfile (Zero RAM bloat)
@@ -124,18 +156,19 @@ m_out = matfile(savefilename, 'Writable', true);
 
 save_idx = 1;
 t_next_save = 0; % First save target (only used once spin-up has ended)
-spinup_done = (spinup_iters <= 0); % if no spin-up requested, start recording immediately
+spinup_done = (t_spinup <= 0); % if no spin-up requested, start recording immediately
 
 % adaptive stepping stuff:
 tol = 1E-1;
 r0 = 0.8*tol;
 dt = 1E-5; % initial time step size
 
-% Main loop
-for ii=1:Nt
-    if mod(ii, countDiag) == 0
+% Main loop -- runs until n_save snapshots are collected, or Nt_max
+% adaptive iterations are hit as a safety cap (shouldn't normally trigger).
+for ii=1:Nt_max
+    if t >= next_diag_t
         if any(isnan(q(:))), break, end
-        if ii > spinup_iters
+        if t > t_spinup
             diagIdx = diagIdx + 1;
             T(diagIdx) = t;
             [ENE,ENS] = Spectrum(q, params);
@@ -145,21 +178,24 @@ for ii=1:Nt
             enstrophy(:, diagIdx) = ENS;
             [VB,UTZ] = QG_Diagnostics(q, params);
             vb(diagIdx) = VB; utz(:, diagIdx) = UTZ;
-            if ii > Nt/2
+            if spinup_done
+                % Accumulate mean/variance over the whole post-spin-up
+                % window (previously this triggered on "ii > Nt/2", which
+                % no longer makes sense since Nt isn't fixed up front).
                 count = count+1;
                 qk1 = qk1+q;
                 qk2 = qk2+abs(q).^2;
             end
-            if mod(ii, 1e4) == 0
-                diagout = struct('ii',ii,'countDiag',countDiag,'dt',dt,'params',params,...
-                    'spinup_iters',spinup_iters,...
+            if mod(diagIdx, 100) == 0
+                diagout = struct('ii',ii,'dt',dt,'params',params,...
                     'T',T(1:diagIdx),'energy',energy(:,1:diagIdx),'enstrophy',enstrophy(:,1:diagIdx),...
                     'vb',vb(1:diagIdx),'utz',utz(:,1:diagIdx),'qp',qp,'X',X,'Y',Y,...
                     'qk1',qk1,'qk2',qk2,'count',count,'dtsize',dtsize(1:diagIdx));
                 save(fullfile(datafolder,'diagnostics.mat'), '-struct', 'diagout', '-v7.3');
             end
         end
-        fprintf('iteration %i\n', ii);
+        fprintf('iteration %i, t=%.4g, saved %i/%i\n', ii, t, save_idx-1, n_save);
+        next_diag_t = next_diag_t + diag_dt;
     end
     
     M = 1./(1-.25*dt*L);
@@ -225,14 +261,14 @@ for ii=1:Nt
     % Check whether spin-up has just ended; if so, start uniform sampling
     % from the next clean dtsave grid point rather than recording anything
     % from the spin-up phase.
-    if ~spinup_done && ii > spinup_iters
+    if ~spinup_done && t_new > t_spinup
         spinup_done = true;
         t_next_save = ceil(t_new/dtsave)*dtsave;
     end
 
     % On-the-fly uniform temporal interpolation and streaming
     if spinup_done
-        while t_next_save <= t_new
+        while t_next_save <= t_new && save_idx <= n_save
             if t_next_save >= t_old && t_next_save <= t_new
                 if abs(t_new - t_old) > 1e-14
                     alpha = (t_next_save - t_old) / (t_new - t_old);
@@ -261,14 +297,26 @@ for ii=1:Nt
     dt = ((.75*tol/r1)^(.3/4))*((r0/r1)^(.4/4))*dt;
     r0 = r1;
     
+    % Real stopping condition: we've collected the target number of
+    % uniform-dt snapshots.
+    if save_idx > n_save
+        fprintf('Reached target of %i uniform snapshots at t=%.4g (iteration %i). Stopping.\n', ...
+            n_save, t, ii);
+        break
+    end
     if any(abs(qp(:))>qlim), break, end
+end
+
+if ii == Nt_max && save_idx <= n_save
+    warning('Driver_Spectral_ARK4_w_unif:hitSafetyCap', ...
+        ['Hit Nt_max=%i adaptive iterations before collecting n_save=%i snapshots ' ...
+         '(only got %i). Consider raising Nt_max.'], Nt_max, n_save, save_idx-1);
 end
 
 if any(isnan(q(:)))
     fprintf('NaN solution detected!\n')
 else
-    diagout = struct('ii',ii,'countDiag',countDiag,'dt',dt,'params',params,...
-        'spinup_iters',spinup_iters,...
+    diagout = struct('ii',ii,'dt',dt,'params',params,...
         'T',T(1:diagIdx),'energy',energy(:,1:diagIdx),'enstrophy',enstrophy(:,1:diagIdx),...
         'vb',vb(1:diagIdx),'utz',utz(:,1:diagIdx),'qp',qp,'X',X,'Y',Y,...
         'qk1',qk1,'qk2',qk2,'count',count,'dtsize',dtsize(1:diagIdx));

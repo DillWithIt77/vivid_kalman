@@ -1,20 +1,18 @@
-function run_diagnostics(dtsave)
-% run_diagnostics.m
-% Loads the vivid ensemble manifest, ensures coarsened data exists
-% (running coarsenqh on the fly if needed), and computes comprehensive diagnostics
-% including spectral energy breakdowns, mode autocorrelations, spin-up energy,
-% zonal velocity structure, and fitted energy spectra.
-
-if nargin < 1
-    dtsave = 0.001;   % Desired time interval for coarsening
+function run_diagnostics(N, dtsave)
+if nargin < 1 || isempty(N)
+    N = 64;
+end
+if nargin < 2 || isempty(dtsave)
+    dtsave = 0.001;
 end
 
 clc;
 
 % --- Configuration ---
-manifest_path = fullfile('data', 'vivid_ensemble_manifest.mat');
-p.N = 128;           % Spatial resolution grid size
-p.beta = 0.05;       % Planetary vorticity gradient
+manifest_path = fullfile('data', sprintf('N%d', N), 'vivid_ensemble_manifest.mat');
+p.beta = 0.05;
+p.dd = 1e-2;
+% p.N is read per-run below from that run's diagnostics.mat, not hardcoded.
 
 fprintf('Using dtsave = %.4g\n', dtsave);
 
@@ -31,9 +29,8 @@ fprintf('Found %d ensemble runs to process.\n', n_runs);
 for irun = 1:n_runs
     fprintf('\n-----------------------------------------\n');
     fprintf('Processing Run %d/%d (Split: %s)\n', irun, n_runs, manifest(irun).split);
-    fprintf('Parameters -> tau0: %.3g, dd: %.3g\n', manifest(irun).tau0, manifest(irun).dd);
-    
-    p.dd = manifest(irun).dd;
+    fprintf('Parameters -> tau0: %.3g\n', manifest(irun).tau0);
+
     datafolder = manifest(irun).datafolder;
 
     if ~exist(datafolder, 'dir')
@@ -73,7 +70,8 @@ for irun = 1:n_runs
     vb_time = zeros(n_tsave, 1);
     
     % Prepare wave numbers and operators for advanced metrics (Modes & Spectra)
-    N = p.N;
+    N = dataext.params.N;  % read per-run, rather than assuming a fixed p.N
+    p.N = N;                % QG_Diagnostics/Spectrum expect N inside p
     k = [0:N/2 -N/2+1:-1]';
     [KX, KY] = meshgrid(k,k);
     Knorm = hypot(KX,KY);
@@ -234,15 +232,32 @@ end
 function [kkp, amin, alpha] = fit_power_law(kp, e, forcingtype)
 % Fits e ~ amin*k^alpha over a fixed inertial range, choosing the exponent
 % based on forcing type (as in plot_spectra.m / plot_spinup_quantities.m).
+%
+% The fit range is capped at the highest wavenumber actually resolved by
+% the grid (max(kp)). Amplitude is solved via closed-form least-squares in
+% log-space rather than fminsearch on mean(log(abs(residual))) -- the
+% latter objective is unbounded below (it diverges to -Inf whenever the
+% fit passes near a data point), which caused "Maximum number of function
+% evaluations exceeded / Current function value: -Inf" especially at low
+% resolution where the fit range has fewer points.
+    kmax = max(kp);
     if strcmp(forcingtype, 'constant')
-        kkp = (1:35)';
+        kkp = (1:min(35, kmax))';
         alpha = -5/3;
     else
-        kkp = (1:45)';
+        kkp = (1:min(45, kmax))';
         alpha = -3;
     end
     [~, ~, ikp] = intersect(kkp, kp);
-    amin = fminsearch(@(a) mean(log(abs(a*kkp.^alpha - e(ikp)))), 1);
+    e_fit = e(ikp);
+
+    % Only use points with strictly positive energy (log undefined at 0/neg)
+    valid = e_fit > 0;
+    if ~any(valid)
+        amin = 1; % degenerate fallback -- no usable points in fit range
+        return;
+    end
+    amin = exp(mean(log(e_fit(valid)) - alpha*log(kkp(valid))));
 end
 
 function overlay_power_law_fit(kp, e, forcingtype)

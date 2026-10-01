@@ -34,7 +34,7 @@ class VCNN(nn.Module):
             in_ch = channels
         self.body = nn.Sequential(*layers)
         # final 1x1-ish conv back to a single-channel state field
-        self.head = nn.Conv2d(channels, 1, kernel_size=1)
+        self.head = nn.Conv2d(channels, 1, kernel_size=8, padding="same")
         self.act = nn.ReLU()  # matches paper's final ReLU (Table 1)
         # NOTE: if your state field X can be negative (PV/vorticity
         # typically is), consider dropping the final ReLU -- the paper
@@ -204,7 +204,8 @@ def estimate_P(residuals, L):
     
     # 2. Compute the raw sample covariance matrix P_t (Eq. 19)
     # rowvar=False treats columns as variables (grid pixels) and rows as samples
-    P_t = np.cov(res_flat, rowvar=False)
+    # P_t = np.cov(res_flat, rowvar=False)
+    P_t = res_flat.T @ res_flat / (n_val - 1)
     
     # 3. Create 2D grid coordinates for every flattened index
     ii, jj = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")

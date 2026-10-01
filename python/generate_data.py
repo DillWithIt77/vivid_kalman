@@ -5,7 +5,7 @@ from pathlib import Path
 # ==========================================
 # GLOBAL CONTROL FLAG
 # ==========================================
-FORCE_RERUN = False  # Set to True to override checks and rerun all MATLAB steps
+FORCE_RERUN = True  # Set to True to override checks and rerun all MATLAB steps
 
 print("Starting MATLAB engine...")
 eng = matlab.engine.start_matlab('-nodisplay -nosplash')
@@ -17,6 +17,7 @@ eng.cd(matlab_code)
 data_dir = Path(matlab_code) / "data"
 manifest_path = data_dir / "vivid_ensemble_manifest.mat"
 
+N = float(64)
 dtsave = 0.01
 
 # ----------------------------------------------------
@@ -26,7 +27,7 @@ if manifest_path.exists() and not FORCE_RERUN:
     print(f"Ensemble manifest found at {manifest_path}. Skipping generate_ensemble.m...")
 else:
     print("Running generate_ensemble.m...")
-    eng.generate_ensemble(dtsave, nargout=0)
+    eng.generate_ensemble(N, dtsave, nargout=0)
 
 # ----------------------------------------------------
 # 2. Check & Run run_diagnostics.m
@@ -55,7 +56,7 @@ if manifest_path.exists() and not FORCE_RERUN:
 
 if diagnostics_needed or FORCE_RERUN:
     print(f"Running run_diagnostics.m with dtsave={dtsave}...")
-    eng.run_diagnostics(dtsave, nargout=0)
+    eng.run_diagnostics(N, dtsave, nargout=0)
 
 # ----------------------------------------------------
 # 3. Check & Run export_snapshots.m
@@ -82,7 +83,7 @@ if manifest_path.exists() and not FORCE_RERUN:
 
 if snapshots_needed or FORCE_RERUN:
     print(f"Running export_snapshots.m with dtsave={dtsave}...")
-    eng.export_snapshots(dtsave, nargout=0)
+    eng.export_snapshots(N, dtsave, nargout=0)
 
 print("Terminating MATLAB engine...")
 eng.quit()

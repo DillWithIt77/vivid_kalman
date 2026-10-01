@@ -1,38 +1,12 @@
-function export_snapshots(dtsave)
-% EXPORT_SNAPSHOTS  Converts the on-the-fly uniform spectral cache produced
-% by Driver_Spectral_ARK4_w_unif.m into physical-space PV snapshots, for
-% every run listed in the ensemble manifest.
-%
-% Usage (mirrors generate_ensemble / run_diagnostics):
-%   export_snapshots(dtsave)
-%
-% Expects to be run with MATLAB's cwd set to the 'matlab_code' folder
-% (i.e. after eng.cd(matlab_code) from Python), so that:
-%   data/vivid_ensemble_manifest.mat   -> holds the struct array 'manifest'
-% Each manifest(k).datafolder is the run's data folder, e.g.
-%   data/baroARK4_N128_..._set-08-07-26-153000
-%
-% For each run folder, this reads:
-%   <datafolder>/coarseqh_dt<dtsave>.mat   (qhc, tsave -- written by the driver)
-% and writes:
-%   <datafolder>/state_snapshots.mat       (tsave, N, X -- physical-space PV)
-%   where X has shape (N, N, n_tsave) in MATLAB, matching the field names
-%   and axis convention expected by pod.py's load_state_snapshots.
-%
-% NOTE: Because the driver uses a fixed number of ADAPTIVE time steps (Nt),
-% not a fixed simulated end time, different runs reach different final
-% simulated times and so export DIFFERENT NUMBERS of snapshots even with
-% the same dtsave. This function intentionally does NOT truncate/pad across
-% runs -- each run's state_snapshots.mat contains all of its own available
-% snapshots. (This is fine for pipelines like exp_pipeline.py that pool
-% snapshots across runs via np.concatenate rather than stacking runs into a
-% fixed-length batch dimension.)
+function export_snapshots(N, dtsave)
+if nargin < 1 || isempty(N)
+    N = 64;
+end
+if nargin < 2 || isempty(dtsave)
+    dtsave = 0.05;
+end
 
-    if nargin < 1 || isempty(dtsave)
-        dtsave = 0.05;
-    end
-
-    manifest_path = fullfile('data', 'vivid_ensemble_manifest.mat');
+    manifest_path = fullfile('data', sprintf('N%d', N), 'vivid_ensemble_manifest.mat');
     if ~isfile(manifest_path)
         error('export_snapshots:missingManifest', ...
             'Could not find %s from current directory (%s).', manifest_path, pwd);

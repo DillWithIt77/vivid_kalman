@@ -22,6 +22,7 @@ if you want to reproduce the paper's Eq. 42 operator instead.
 import numpy as np
 import torch
 from scipy.optimize import minimize
+from sensors import nonlinear_observation_field_torch
 
 
 # ---------------------------------------------------------------- metrics --
@@ -37,7 +38,7 @@ def ssim(x_est, x_true, data_range=None):
     try:
         from skimage.metrics import structural_similarity as sk_ssim
     except ImportError as e:
-        raise ImportError("pip install scikit-image for SSIM") from 
+        raise ImportError("pip install scikit-image for SSIM") from e
     if data_range is None:
         data_range = x_true.max() - x_true.min()
     return sk_ssim(x_est, x_true, data_range=data_range)
@@ -66,9 +67,20 @@ def bg_term_autograd(x, x_b, Sk_tensor):
     return 0.5 * torch.sum(quad)
 
 
-def obs_term(x, y_obs, sensor_coords, r_obs_std):
-    """0.5 * ||y - H(x)||^2_{R^-1}, R = r_obs_std^2 * I (Eq. 1's R_t)."""
-    Hx = _sample_at_sensors(x, sensor_coords)
+def obs_term(x, y_obs, sensor_coords, r_obs_std, nonlinear=False, r1=3, r2=1.5):
+    """0.5 * ||y - H(x)||^2_{R^-1}, R = r_obs_std^2 * I (Eq. 1's R_t).
+
+    H is either the identity sampling operator (Eq. 12, nonlinear=False)
+    or the paper's local weighted-sum-of-squares operator (Eq. 42-44,
+    nonlinear=True) -- must match whichever generated y_obs in
+    sensors.build_tessellated_observation, or the DA cost function is
+    being fit against observations that don't correspond to its own H.
+    """
+    if nonlinear:
+        field = nonlinear_observation_field_torch(x, r1=r1, r2=r2)
+    else:
+        field = x
+    Hx = _sample_at_sensors(field, sensor_coords)
     resid = y_obs - Hx
     return 0.5 * torch.sum(resid**2) / (r_obs_std**2 + 1e-12)
 
@@ -115,22 +127,28 @@ def _run_lbfgs(objective_fn, x0, N, maxiter=200):
     return res.x.reshape(N, N), res.nit, history["J"]
 
 
-def da_3dvar(x_b, y_obs, sensor_coords, B_cov, r_obs_std, maxiter=200):
-    """Conventional 3D-Var, Eq. 1. Returns (x_analysis, n_iter, J_history)."""
+def da_3dvar(x_b, y_obs, sensor_coords, B_cov, r_obs_std, s_b, maxiter=200, nonlinear=False):
+    """Conventional 3D-Var, Eq. 1. Returns (x_analysis, n_iter, J_history).
+
+    s_b: background error std used to generate x_b (Eq. 41). B_cov.Sk is
+    the UNIT-VARIANCE correlation spectrum -- the true B_t = s_b^2 * C,
+    so it must be scaled by s_b**2 here, or the background term is
+    weighted ~1/s_b**2 times too weakly relative to J_p/J_o.
+    """
     N = x_b.shape[0]
-    Sk_B = torch.tensor(B_cov.Sk, dtype=torch.float64)
+    Sk_B = torch.tensor(B_cov.Sk, dtype=torch.float64) * s_b**2
     x_b_t = torch.tensor(x_b, dtype=torch.float64)
     y_t = torch.tensor(y_obs, dtype=torch.float64)
 
     def objective(x_t):
         J_b = bg_term_autograd(x_t, x_b_t, Sk_B)
-        J_o = obs_term(x_t, y_t, sensor_coords, r_obs_std)
+        J_o = obs_term(x_t, y_t, sensor_coords, r_obs_std, nonlinear=nonlinear)
         return J_b + J_o
 
     return _run_lbfgs(objective, x_b.copy(), N, maxiter=maxiter)
 
 
-def _dense_P_inv(P_t_localized, rcond=1e-6):
+def _dense_P_inv(P_t_localized, rcond=1e-2):
     """
     Build the regularized inverse of a dense empirical covariance matrix
     (from vcnn.estimate_P) once, for reuse across all DA solves in a run.
@@ -150,21 +168,16 @@ def _dense_P_inv(P_t_localized, rcond=1e-6):
     return P_inv
 
 
-def da_vivid(x_b, x_v, y_obs, sensor_coords, B_cov, P_cov, r_obs_std, maxiter=200):
+def da_vivid(x_b, x_v, y_obs, sensor_coords, B_cov, P_cov, r_obs_std, s_b, maxiter=200, nonlinear=False):
     """
     VIVID, Eq. 18: background + inverse-operator + observation terms.
     x_v: VCNN(Y_tilde) prediction, same shape as x_b (Section 3.2).
-
-    P_cov may be either:
-      - a StationaryCovariance (or duck-type exposing `.Sk`) -- uses the
-        cheap Fourier-diagonal path, or
-      - a torch.Tensor of shape (N*N, N*N) -- treated as an already
-        regularized dense P^-1 (see `_dense_P_inv`), and the true
-        empirical covariance from `vcnn.estimate_P` (Eq. 19-21) is used
-        directly via a dense quadratic form.
+    ...
+    s_b: background error std used to generate x_b (Eq. 41) -- see
+    da_3dvar's docstring for why Sk_B must be scaled by s_b**2.
     """
     N = x_b.shape[0]
-    Sk_B = torch.tensor(B_cov.Sk, dtype=torch.float64)
+    Sk_B = torch.tensor(B_cov.Sk, dtype=torch.float64) * s_b**2
     x_b_t = torch.tensor(x_b, dtype=torch.float64)
     x_v_t = torch.tensor(x_v, dtype=torch.float64)
     y_t = torch.tensor(y_obs, dtype=torch.float64)
@@ -181,7 +194,7 @@ def da_vivid(x_b, x_v, y_obs, sensor_coords, B_cov, P_cov, r_obs_std, maxiter=20
             J_p = inv_op_term_dense(x_t, x_v_t, P_inv_t)
         else:
             J_p = inv_op_term(x_t, x_v_t, Sk_P)
-        J_o = obs_term(x_t, y_t, sensor_coords, r_obs_std)
+        J_o = obs_term(x_t, y_t, sensor_coords, r_obs_std, nonlinear=nonlinear)
         return J_b + J_p + J_o
 
     x0 = 0.5 * (x_b + x_v)  # informed initialization

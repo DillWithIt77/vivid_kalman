@@ -46,7 +46,7 @@ from pod import load_state_snapshots, compute_pod_basis
 from sensors import build_tessellated_observation
 from background_error import make_background, StationaryCovariance, matern32
 from vcnn import VCNN, train_vcnn, estimate_P, inv_op_residuals
-from vivid_da import da_3dvar, da_vivid, r_rmse, ssim
+from vivid_da import da_3dvar, da_vivid, r_rmse, ssim, _dense_P_inv
 
 
 def log_mem(tag):
@@ -60,6 +60,7 @@ def log_mem(tag):
 log_mem("script start")
 
 rng = np.random.default_rng(0)
+torch.manual_seed(0)
 
 # ==========================================
 # DEVICE SETUP
@@ -67,91 +68,141 @@ rng = np.random.default_rng(0)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 if device == "cuda":
+    torch.cuda.manual_seed_all(0)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+
 
 # ==========================================
 # GLOBAL CONTROL FLAG
 # ==========================================
-FORCE_RERUN = False  # Set to True to override caches and run everything fresh
+FORCE_RERUN = True  # Set to True to override caches and run everything fresh
+USE_SHALLOW_WATER_CHECK = False  # sanity-check mode: bypass MATLAB/QG data
+                                  # entirely, use generate_shallow_water_data.py's
+                                  # output instead, to isolate whether the
+                                  # PyTorch pipeline itself is correct.
 
-# Setup directories
-script_dir = Path(__file__).resolve().parent
+# ==========================================
+# RESOLUTION
+# ==========================================
+N_RES = 50 if USE_SHALLOW_WATER_CHECK else 64
+
+script_dir = Path(__file__).resolve().parent   # <-- MUST come first
 base_dir = script_dir.parent
-cache_dir = script_dir / "cache_outputs"
-cache_dir.mkdir(exist_ok=True)
+
+if USE_SHALLOW_WATER_CHECK:
+    run_tag = "shallow_water_check"
+else:
+    run_tag = f"N{N_RES}"
+
+cache_dir = script_dir / "cache_outputs" / run_tag
+cache_dir.mkdir(parents=True, exist_ok=True)
 npy_cache_dir = cache_dir / "npy_runs"
 npy_cache_dir.mkdir(exist_ok=True)
-output_dir = script_dir / "plot_outputs"
-output_dir.mkdir(exist_ok=True)
-model_output_dir = script_dir / "model_outputs"
-model_output_dir.mkdir(exist_ok=True)
+output_dir = script_dir / "plot_outputs" / run_tag
+output_dir.mkdir(parents=True, exist_ok=True)
+model_output_dir = script_dir / "model_outputs" / run_tag
+model_output_dir.mkdir(parents=True, exist_ok=True)
 
 # ---- 1. Convert MATLAB runs to per-run float32 .npy caches -----------------
-# Only ONE run's worth of data is ever fully in RAM at a time during this
-# conversion step; everything downstream reads via memmap.
-print('Resolving MATLAB manifest...')
-manifest_path = base_dir / "matlab" / "data" / "vivid_ensemble_manifest.mat"
-if not manifest_path.exists():
-    manifest_path = base_dir / "data" / "vivid_ensemble_manifest.mat"
+if USE_SHALLOW_WATER_CHECK:
+    print('USE_SHALLOW_WATER_CHECK=True: using shallow-water .npy runs '
+          'from generate_shallow_water_data.py instead of MATLAB/QG data.')
+    sw_dir = script_dir / "cache_outputs" / "shallow_water_check" / "npy_runs"
+    train_npy_paths_sw = sorted(sw_dir.glob("sw_*_train.npy"))
+    test_npy_paths_sw = sorted(sw_dir.glob("sw_*_test.npy"))
 
-mat_data = sio.loadmat(manifest_path, squeeze_me=True)
-manifest = mat_data["manifest"]
-del mat_data
-gc.collect()
+    if not train_npy_paths_sw or not test_npy_paths_sw:
+        raise FileNotFoundError(
+            f"Shallow-water check data not found in {sw_dir}. "
+            "Run generate_shallow_water_data.py first."
+        )
 
-train_run_paths = []
-test_run_path = None
-for run in manifest:
-    folder_name = str(run["datafolder"])
-    split = str(run["split"])
+    # All 4 Table-3 train combos are pooled together here, matching the
+    # paper's actual training code (VCNN_training.py concatenates all
+    # train-regime runs and takes a random validation_split=0.05 from the
+    # pool). Only the true test run (h_p=0.2, r_w=6) stays held out.
+    pool_npy_paths = train_npy_paths_sw
+    test_npy_path = test_npy_paths_sw[0]
+else:
+    print('Resolving MATLAB manifest...')
+    manifest_path = base_dir / "matlab" / "data" / f"N{N_RES}" / "vivid_ensemble_manifest.mat"
+    if not manifest_path.exists():
+        manifest_path = base_dir / "data" / f"N{N_RES}" / "vivid_ensemble_manifest.mat"
 
-    run_path = base_dir / "matlab" / folder_name / "state_snapshots.mat"
-    if not run_path.exists():
-        run_path = base_dir / folder_name / "state_snapshots.mat"
-
-    if split.lower() in ["train", "training"]:
-        train_run_paths.append(run_path)
-    elif split.lower() in ["test", "heldout"]:
-        test_run_path = run_path
-
-del manifest
-gc.collect()
-
-
-def ensure_npy_cache(mat_path, out_path):
-    """Convert one .mat run to a float32 .npy file if not already cached.
-    Loads exactly one run into RAM, writes it, then drops it -- never holds
-    more than one run's worth of data at once."""
-    if out_path.exists() and not FORCE_RERUN:
-        return
-    X, t = load_state_snapshots(str(mat_path))
-    X = X.astype(np.float32, copy=False)
-    np.save(out_path, X)
-    del X, t
+    mat_data = sio.loadmat(manifest_path, squeeze_me=True)
+    manifest = mat_data["manifest"]
+    del mat_data
     gc.collect()
 
+    train_run_paths = []
+    test_run_path = None
+    for run in manifest:
+        folder_name = str(run["datafolder"])
+        split = str(run["split"])
 
-print(f'Converting {len(train_run_paths)} training run(s) to npy cache (streamed, one at a time)...')
-train_npy_paths = []
-for p in train_run_paths:
-    out = npy_cache_dir / f"{p.parent.name}_train.npy"
-    ensure_npy_cache(p, out)
-    train_npy_paths.append(out)
-    log_mem(f"after converting run {p.parent.name}")
+        run_path = base_dir / "matlab" / folder_name / "state_snapshots.mat"
+        if not run_path.exists():
+            run_path = base_dir / folder_name / "state_snapshots.mat"
 
-test_npy_path = npy_cache_dir / "test_run.npy"
-ensure_npy_cache(test_run_path, test_npy_path)
-log_mem("after converting test run")
+        if split.lower() in ["train", "training"]:
+            train_run_paths.append(run_path)
+        elif split.lower() in ["test", "heldout"]:
+            test_run_path = run_path
+
+    del manifest
+    gc.collect()
+
+    # POOLED train/val split (matches the paper's actual training code,
+    # VCNN_training.py: they concatenate ALL train-regime simulations into
+    # one array and use Keras's validation_split=0.05 -- a random subsample
+    # of pooled snapshots, NOT a held-out physical regime. The held-out
+    # regime (test_run_path / tau0 furthest from training) is reserved
+    # solely for the final generalization evaluation, never touched during
+    # training or monitored via val_loss.
+    #
+    # Previously this used train_run_paths[:3] for training and a single
+    # held-out tau0 (train_run_paths[3]) as "validation" -- that's actually
+    # a harder generalization test than what the paper's val_loss measures,
+    # and it produced a val_loss curve that never tracked train_loss
+    # because it was answering a different question (generalization to an
+    # unseen regime) than "is training converging" (which random-split
+    # validation, IID with training, actually measures).
+    pool_run_paths = train_run_paths  # ALL non-test manifest runs get pooled
+
+    def ensure_npy_cache(mat_path, out_path):
+        if out_path.exists() and not FORCE_RERUN:
+            return
+        X, t = load_state_snapshots(str(mat_path))
+        X = X.astype(np.float32, copy=False)
+        np.save(out_path, X)
+        del X, t
+        gc.collect()
+
+    print(f'Converting {len(pool_run_paths)} pooled train+val run(s) to npy cache (streamed, one at a time)...')
+    pool_npy_paths = []
+    for p in pool_run_paths:
+        out = npy_cache_dir / f"{p.parent.name}_pool.npy"
+        ensure_npy_cache(p, out)
+        pool_npy_paths.append(out)
+        log_mem(f"after converting run {p.parent.name}")
+
+    test_npy_path = npy_cache_dir / "test_run.npy"
+    ensure_npy_cache(test_run_path, test_npy_path)
+    log_mem("after converting test run")
 
 # Memory-map for lazy, on-demand access -- this does NOT load the arrays
 # into RAM, it just opens the files.
-train_memmaps = [np.load(p, mmap_mode='r') for p in train_npy_paths]
+pool_memmaps = [np.load(p, mmap_mode='r') for p in pool_npy_paths]
 test_memmap = np.load(test_npy_path, mmap_mode='r')
 
-N = train_memmaps[0].shape[1]
-run_lengths = [m.shape[0] for m in train_memmaps]
-n_train_total = int(sum(run_lengths))
-print(f"Total training snapshots (virtual, on disk): {n_train_total}, N={N}")
+N = pool_memmaps[0].shape[1]
+assert N == N_RES, (
+    f"Data grid size ({N}) doesn't match configured N_RES ({N_RES}) -- "
+    f"check that generate_ensemble.m was run with the same N."
+)
+run_lengths = [m.shape[0] for m in pool_memmaps]
+n_pool_total = int(sum(run_lengths))
+print(f"Total pooled train+val snapshots (virtual, on disk): {n_pool_total}, N={N}")
 print(f"Test snapshots (virtual, on disk): {test_memmap.shape[0]}")
 log_mem("after opening memmaps (no bulk data loaded into RAM yet)")
 
@@ -208,15 +259,29 @@ class LazyTessellatedDataset(Dataset):
         return Y_t, X_t
 
 
-full_train_dataset = LazyTessellatedDataset(train_memmaps, N_GRID, seed=0, deterministic=True)
-n_val = max(1, len(full_train_dataset) // 10)
-val_dataset = Subset(full_train_dataset, list(range(n_val)))
+# Single dataset over ALL pooled train+val runs, then a RANDOM index-level
+# split -- matching the paper's actual val_split=0.05 (IID with training,
+# not a held-out physical regime). VAL_FRACTION=0.05 mirrors their exact
+# choice; adjust if you want a larger monitoring set.
+VAL_FRACTION = 0.05
+pool_dataset = LazyTessellatedDataset(pool_memmaps, N_GRID, seed=0, deterministic=True)
+
+n_pool = len(pool_dataset)
+n_val = max(1, int(round(VAL_FRACTION * n_pool)))
+n_train = n_pool - n_val
+
+generator = torch.Generator().manual_seed(0)  # reproducible split
+train_subset, val_subset = torch.utils.data.random_split(
+    pool_dataset, [n_train, n_val], generator=generator)
+
+print(f"Pooled dataset split: {n_train} train / {n_val} val "
+      f"({VAL_FRACTION*100:.1f}% held out, IID with training)")
 
 # num_workers>0 lets multiple CPU workers prefetch batches in parallel while
 # the GPU/CPU trains -- tune based on how many cores your Slurm allocation
 # gives you (e.g. match --cpus-per-task).
-train_loader = DataLoader(full_train_dataset, batch_size=16, shuffle=True, num_workers=2)
-val_loader = DataLoader(val_dataset, batch_size=16, num_workers=0)
+train_loader = DataLoader(train_subset, batch_size=64, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_subset, batch_size=16, num_workers=0)
 
 log_mem("after building lazy DataLoaders (still no bulk data in RAM)")
 
@@ -237,7 +302,7 @@ else:
         train_loader,
         val_loader=val_loader,
         n_epochs=20,
-        lr=1e-3,
+        lr=1e-4,
         device=device,
         save_path=best_model_path
     )
@@ -260,12 +325,12 @@ def calc_rrmse(x_pred, x_ref):
     return np.linalg.norm(x_pred - x_ref) / np.linalg.norm(x_ref)
 
 
-n_check = min(10, len(full_train_dataset))
-check_idx = np.random.default_rng(1).choice(len(full_train_dataset), size=n_check, replace=False)
+n_check = min(10, len(train_subset))
+check_idx = np.random.default_rng(1).choice(len(train_subset), size=n_check, replace=False)
 
 rrmse_v_train = []
 for idx in check_idx:
-    Yt_in, x_true_t = full_train_dataset[int(idx)]  # pulls one snapshot from disk
+    Yt_in, x_true_t = train_subset[int(idx)]  # pulls one snapshot from disk
     x_true_train = x_true_t.numpy()[0].astype(np.float64)
     with torch.no_grad():
         x_v_train = model(Yt_in[None].to(device)).cpu().numpy()[0, 0].astype(np.float64)
@@ -278,10 +343,12 @@ print(f"In-distribution (train-run) raw VCNN R-RMSE: "
 log_mem("after diagnostic block")
 
 # ---- 4. Estimate P_t from residuals on the validation split (Eq. 19) -----
-L = 5.0
+L = 5.0 if USE_SHALLOW_WATER_CHECK else 9.0
 residuals_raw = inv_op_residuals(model, val_loader, device=device)
 residuals = residuals_raw.squeeze(axis=1)
 P_t_localized = estimate_P(residuals, L=L)  # dense (N*N, N*N), Eq. 19-21
+
+np.save(cache_dir / "P_t_localized.npy", P_t_localized)
 
 print(f"P_t_localized shape={P_t_localized.shape} "
       f"({P_t_localized.nbytes/1e6:,.1f} MB)", flush=True)
@@ -290,9 +357,10 @@ print(f"P_t_localized shape={P_t_localized.shape} "
 # below (rebuilding per-snapshot would be wasteful -- it's the same matrix
 # each time). rcond controls how aggressively near-zero singular values
 # (expected, since n_val is typically << N*N) are treated as zero.
-from vivid_da import _dense_P_inv
-P_inv_np = _dense_P_inv(P_t_localized, rcond=1e-6)
+P_inv_np = _dense_P_inv(P_t_localized, rcond=1e-2)
 P_inv_t = torch.tensor(P_inv_np, dtype=torch.float64)
+
+np.save(cache_dir / "P_inv_t.npy", P_inv_t.numpy())
 
 del residuals_raw, residuals, val_loader, P_t_localized, P_inv_np
 gc.collect()
@@ -303,17 +371,33 @@ log_mem("after computing P_t_localized and its regularized inverse")
 # ---- 5. Run DA comparison on the held-out test run (with caching per snapshot) ----
 USE_LOCALIZATION = False
 print('Run DA comparison and saving spatial data...')
-s_b = 0.02
+s_b = 0.02 if USE_SHALLOW_WATER_CHECK else 1.1675
 r_obs_std = 0.0
 
 N_TEST_SNAPSHOTS = 20
-n_snapshots = min(N_TEST_SNAPSHOTS, test_memmap.shape[0])
+n_available = test_memmap.shape[0]
+n_snapshots = min(N_TEST_SNAPSHOTS, n_available)
+
+# Stride evenly across the whole recorded (post-spinup) test trajectory,
+# rather than taking a contiguous prefix -- this mirrors the paper's setup
+# (20 snapshots extracted every 5e-4s across the full 0.01s simulation),
+# giving decorrelated, representative states instead of 20 back-to-back
+# (highly autocorrelated) samples from right after spin-up.
+if USE_SHALLOW_WATER_CHECK:
+    # window_start = int(0.2 * n_available)
+    # window_end = int(0.6 * n_available)
+    # test_indices = np.linspace(window_start, window_end, n_snapshots, dtype=int)
+    window_start = 300
+    window_end = 1500
+    test_indices = np.linspace(window_start, window_end, n_snapshots, dtype=int)
+else:
+    test_indices = np.linspace(0, n_available - 1, n_snapshots, dtype=int)
 print(f"Running DA comparison on {n_snapshots} test snapshots "
-      f"(out of {test_memmap.shape[0]} available)...")
+      f"(indices {test_indices[0]}..{test_indices[-1]} out of {n_available} available)...")
 
 results = {"DA": [], "VIVID": []}
 
-for i in range(n_snapshots):
+for i in test_indices:
     # Pull just this one snapshot from disk -- the full test set is never
     # loaded into RAM.
     x_true = np.array(test_memmap[i], dtype=np.float64)
@@ -332,19 +416,25 @@ for i in range(n_snapshots):
     else:
         x_b, B_cov = make_background(x_true, s_b=s_b, L=L, rng=rng, localize=USE_LOCALIZATION)
 
+        np.save(cache_dir / "Sk_B.npy", B_cov.Sk)
+
         Y_tilde, coords, y_obs = build_tessellated_observation(
-            x_true, n_grid=N_GRID, r_s=3, obs_noise_std=r_obs_std, rng=rng)
+            x_true, n_grid=N_GRID, r_s=3, obs_noise_std=r_obs_std, rng=rng, nonlinear=USE_NONLINEAR_OBS)
         coords_t = torch.tensor(coords)
 
         x_a_da, n_iter_da, j_hist_da = da_3dvar(x_b, y_obs, coords_t, B_cov,
-                                                 r_obs_std=max(r_obs_std, 1e-3))
+                                            r_obs_std=max(r_obs_std, np.sqrt(1e-3)),
+                                            s_b=s_b,
+                                            nonlinear=USE_NONLINEAR_OBS)
 
         with torch.no_grad():
             Yt_in = torch.tensor(Y_tilde[None, None], dtype=torch.float32, device=device)
             x_v = model(Yt_in).cpu().numpy()[0, 0].astype(np.float64)
         x_a_vivid, n_iter_vivid, j_hist_vivid = da_vivid(x_b, x_v, y_obs, coords_t,
-                                                         B_cov, P_inv_t,
-                                                         r_obs_std=max(r_obs_std, 1e-3))
+                                                 B_cov, P_inv_t,
+                                                 r_obs_std=max(r_obs_std, np.sqrt(1e-3)),
+                                                 s_b=s_b,
+                                                 nonlinear=USE_NONLINEAR_OBS)
 
         results["DA"].append(r_rmse(x_a_da, x_true))
         results["VIVID"].append(r_rmse(x_a_vivid, x_true))

@@ -1,41 +1,48 @@
 % generate_ensemble.m
-function generate_ensemble(uniform_dt)
-    N        = 128;
+function generate_ensemble(N, uniform_dt)
+    if nargin < 1 || isempty(N)
+        N = 64; % default resolution if not specified
+    end
+    N = double(N);
     beta     = 0.05;
-    kf       = 50; epsf = 0; sigf = 1; alpf = 0;   
+    kf       = 50; epsf = 0; sigf = 1; alpf = 0;
     tdel     = 0;
     forcing_type = 'sin';
-    Nt       = 2e4;   
-    spinup_frac = 0.1; % fraction of Nt treated as spin-up and excluded from recording
+    dd       = 1e-2; 
 
-    PARAM_GRID = [ ...
-        0.03, 5e-3; ...
-        0.04, 5e-3; ...
-        0.03, 8e-3; ...
-        0.04, 8e-3; ...
-        0.05, 6e-3  ... 
+    t_spinup = 3000;
+    n_save   = 10000;
+    Nt_max   = 6e6;
+    n_diag   = 200;
+
+    PARAM_GRID=[ ...
+        0.1;...
+        0.15;...
+        0.2;...
+        0.25;...
+        0.22;...
     ];
     n_runs = size(PARAM_GRID,1);
 
-    % Define a dedicated data output directory inside your matlab folder
-    output_base_dir = fullfile('data');
+    % Manifest lives alongside the run folders the driver already creates
+    % under data/N{N}/ -- the driver decides that path itself from N, so
+    % we just need to match it here for the manifest.
+    output_base_dir = fullfile('data', sprintf('N%d', N));
     if ~exist(output_base_dir, 'dir')
         mkdir(output_base_dir);
     end
 
-    manifest = struct('datafolder', {}, 'tau0', {}, 'dd', {}, 'split', {});
+    manifest = struct('datafolder', {}, 'tau0', {}, 'split', {}, 'N', {});
     for irun = 1:n_runs
         tau0 = PARAM_GRID(irun,1);
-        dd   = PARAM_GRID(irun,2);
-        fprintf('=== Ensemble run %d/%d: tau0=%.3g, dd=%.3g ===\n', irun, n_runs, tau0, dd);
-        
-        % Run the new solver with on-the-fly uniform time saving[cite: 2, 3]
-        actual_folder = Driver_Spectral_ARK4_w_unif(N, beta, kf, epsf, sigf, alpf, ...
-            dd, tau0, tdel, Nt, forcing_type, uniform_dt, spinup_frac);
+        fprintf('=== Ensemble run %d/%d: tau0=%.3g, N=%d ===\n', irun, n_runs, tau0, N);
 
-        manifest(irun).datafolder = actual_folder; 
+        actual_folder = Driver_Spectral_ARK4_w_unif(N, beta, kf, epsf, sigf, alpf, ...
+            dd, tau0, tdel, t_spinup, n_save, forcing_type, uniform_dt, Nt_max, n_diag);
+
+        manifest(irun).datafolder = actual_folder;
         manifest(irun).tau0 = tau0;
-        manifest(irun).dd = dd;
+        manifest(irun).N = N;
         if irun == n_runs
             manifest(irun).split = 'test';
         else
